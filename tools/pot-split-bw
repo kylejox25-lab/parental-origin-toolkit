@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# pot-split-bw — parent-specific bigWig tracks from SNPsplit-split BAMs.
+#
+# Usage: pot-split-bw -s SAMPLE_ID [OPTIONS]
+#   --split-dir DIR   (default: config defaults.split_dir/<SAMPLE_ID>)
+#   -1 G1.bam -2 G2.bam   ...or give the two BAMs directly
+#   --bs N            bin size (default: 50)
+#   --no-cpm          raw coverage (default: CPM-scaled)
+#   --scale F         explicit scale factor (overrides --cpm)
+#   -o DIR            output dir (default: ./bigwig/<SAMPLE_ID>)
+#   -c, --config FILE
+#
+# Outputs: genome1.bw, genome2.bw, maternal.bw/paternal.bw (per samples.tsv),
+#          scale_factors.txt
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+SID=""; SPLIT_DIR=""; B1=""; B2=""; BS="50"; NO_CPM=0; SCALE=""; OUT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s) SID="$2"; shift 2 ;;
+    --split-dir) SPLIT_DIR="$2"; shift 2 ;;
+    -1) B1="$2"; shift 2 ;;
+    -2) B2="$2"; shift 2 ;;
+    --bs) BS="$2"; shift 2 ;;
+    --no-cpm) NO_CPM=1; shift ;;
+    --scale) SCALE="$2"; shift 2 ;;
+    -o) OUT="$2"; shift 2 ;;
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+if [[ -z "$B1" || -z "$B2" ]]; then
+  [[ -n "$SID" ]] || die "provide -1/-2 BAMs or -s SAMPLE_ID"
+  [[ -n "$SPLIT_DIR" ]] || SPLIT_DIR="$(potcfg defaults.split_dir)/$SID"
+  [[ -n "$SPLIT_DIR" ]] || SPLIT_DIR="split/$SID"
+  find_split_bams "$SPLIT_DIR"
+  B1="$G1_BAM"; B2="$G2_BAM"
+fi
+[[ -n "$OUT" ]] || OUT="bigwig/$SID"
+mkdir -p "$OUT"
+
+ST="$(pot_resolve tools.samtools samtools)"
+BT="$(pot_resolve tools.bedtools bedtools)"
+B2BW="$(pot_resolve tools.bedGraphToBigWig bedGraphToBigWig)"
+
+sizes_from_bam "$B1" > "$OUT/chrom.sizes"
+
+make_bw() { # $1=bam $2=name $3=scale
+  local bam="$1" name="$2" scale="$3"
+  "$BT" genomecov -bg -ibam "$bam" \
+    | awk -v s="$scale" 'BEGIN{OFS="\t"}{$4 = $4 * s; print}' \
+    | "$B2BW" stdin "$OUT/chrom.sizes" "$OUT/$name.bw"
+}
+
+scale_for() { # CPM scale factor = 1e6 / primary mapped reads
+  local n
+  n=$("$ST" view -c -F 260 "$1")
+  awk -v n="$n" 'BEGIN{printf "%.6g", (n > 0 ? 1000000 / n : 1)}'
+}
+
+F1=1; F2=1
+if [[ -n "$SCALE" ]]; then
+  F1="$SCALE"; F2="$SCALE"
+elif [[ $NO_CPM -eq 0 ]]; then
+  F1=$(scale_for "$B1")
+  F2=$(scale_for "$B2")
+fi
+
+make_bw "$B1" genome1 "$F1"
+make_bw "$B2" genome2 "$F2"
+
+printf 'track\tscale\n' > "$OUT/scale_factors.txt"
+printf 'genome1\t%s\n' "$F1" >> "$OUT/scale_factors.txt"
+printf 'genome2\t%s\n' "$F2" >> "$OUT/scale_factors.txt"
+
+# parental labels per samples.tsv (optional)
+if [[ -n "$SID" ]] && pot_sample "$SID" genome1 >/dev/null 2>&1; then
+  G1_STRAIN="$(pot_sample "$SID" genome1)"
+  G2_STRAIN="$(pot_sample "$SID" genome2)"
+  MAT="$(pot_sample "$SID" maternal)"
+  if [[ "$MAT" == "$G1_STRAIN" ]]; then
+    ln -sf genome1.bw "$OUT/maternal.bw"
+    ln -sf genome2.bw "$OUT/paternal.bw"
+  elif [[ "$MAT" == "$G2_STRAIN" ]]; then
+    ln -sf genome2.bw "$OUT/maternal.bw"
+    ln -sf genome1.bw "$OUT/paternal.bw"
+  else
+    log "warning: samples.tsv maternal '$MAT' matches neither genome1 ($G1_STRAIN) nor genome2 ($G2_STRAIN)"
+  fi
+fi
+
+log "done: $OUT (scale factors in scale_factors.txt)"

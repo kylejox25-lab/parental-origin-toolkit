@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# pot-build-dsnp — build the parental dSNP (discriminating SNP) set for a strain pair.
+#
+# Usage: pot-build-dsnp -1 STRAIN_A -2 STRAIN_B [OPTIONS]
+#   -o PREFIX         output prefix (default: <A>_<B>.dsnp)
+#   --filter EXPR     bcftools -i expression (default: config defaults.dsnp_filter)
+#   --min-qual Q      shorthand to append QUAL>=Q to the filter
+#   --min-dp D        shorthand to append FMT/DP>=D to the filter
+#   -c, --config FILE config file (default: config.yaml)
+#
+# One of the two strains may be a reference alias (BL6/C57BL_6J/GRCm38/...):
+# that parent contributes no VCF (its genotype is 0/0 at every site).
+#
+# Logic:
+#   ref x strain  -> strain VCF hom-ALT sites (the classic MGP scheme)
+#   strain x strain -> A-specific (A hom-ALT, B hom-REF) UNION
+#                      B-specific (B hom-ALT, A hom-REF)
+#
+# Outputs:
+#   <PREFIX>.vcf.gz          single-sample VCF (ref x strain), or two-sample
+#                            merged VCF (arbitrary pair; missing GT filled 0/0)
+#   <PREFIX>.origin.tsv.gz   chr  pos  ref  alt  origin_strain
+#   <PREFIX>.dsnp.bed.gz     chr  start  end  ref  alt  origin_strain (BED, 0-based)
+#   <PREFIX>.meta.txt        provenance (strains, filter, mode, date)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+A=""; B=""; PREFIX=""; FILTER=""; MINQ=""; MINDP=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -1) A="$2"; shift 2 ;;
+    -2) B="$2"; shift 2 ;;
+    -o) PREFIX="$2"; shift 2 ;;
+    --filter) FILTER="$2"; shift 2 ;;
+    --min-qual) MINQ="$2"; shift 2 ;;
+    --min-dp) MINDP="$2"; shift 2 ;;
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$A" && -n "$B" ]] || { usage; exit 1; }
+[[ -n "$PREFIX" ]] || PREFIX="${A}_${B}.dsnp"
+[[ -n "$FILTER" ]] || FILTER="$(potcfg defaults.dsnp_filter)"
+[[ -n "$FILTER" ]] || FILTER='GT="1/1" && QUAL>=30 && FMT/DP>=10'
+[[ -n "$MINQ" ]] && FILTER="$FILTER && QUAL>=$MINQ"
+[[ -n "$MINDP" ]] && FILTER="$FILTER && FMT/DP>=$MINDP"
+
+BCF="$(pot_resolve tools.bcftools bcftools)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# Resolve the VCF for a strain; exit with a hint if missing.
+vcf_for() {
+  local s="$1" v
+  if is_ref_strain "$s"; then echo ""; return; fi
+  v="$(potcfg "strains.$s")"
+  [[ -n "$v" && -s "$v" ]] \
+    || die "no VCF for strain '$s': download with pot-get-strain $s and add it to config.yaml strains.$s"
+  echo "$v"
+}
+
+VA="$(vcf_for "$A")"
+VB="$(vcf_for "$B")"
+[[ -z "$VA" && -z "$VB" ]] && die "both strains are reference aliases"
+
+if [[ -z "$VA" || -z "$VB" ]]; then
+  # ref x strain: the strain VCF's hom-ALT sites are the dSNP set.
+  S=""; V=""
+  if [[ -z "$VA" ]]; then S="$B"; V="$VB"; else S="$A"; V="$VA"; fi
+  log "mode: reference x strain ($S)"
+  "$BCF" view -Oz -i "$FILTER" -o "$PREFIX.vcf.gz" "$V"
+  "$BCF" index -t "$PREFIX.vcf.gz"
+  "$BCF" query -i "$FILTER" -f "%CHROM\t%POS\t%REF\t%ALT\t$S\n" "$V" \
+    | sort -k1,1 -k2,2n -S 4G > "$TMP/origin.tsv"
+  MODE="reference_x_strain"
+else
+  # arbitrary pair: symmetric difference of hom-ALT / hom-REF sites.
+  log "mode: dual strain ($A x $B)"
+  "$BCF" view -Oz -i "$FILTER"  -o "$TMP/a_alt.vcf.gz" "$VA"
+  "$BCF" view -Oz -i 'GT!="0/0"' -o "$TMP/a_var.vcf.gz" "$VA"
+  "$BCF" view -Oz -i "$FILTER"  -o "$TMP/b_alt.vcf.gz" "$VB"
+  "$BCF" view -Oz -i 'GT!="0/0"' -o "$TMP/b_var.vcf.gz" "$VB"
+  # 0001.vcf.gz = records present in file 1 only
+  "$BCF" isec -p "$TMP/ab" -n=1 "$TMP/a_alt.vcf.gz" "$TMP/b_var.vcf.gz" >/dev/null
+  "$BCF" isec -p "$TMP/ba" -n=1 "$TMP/b_alt.vcf.gz" "$TMP/a_var.vcf.gz" >/dev/null
+  [[ -s "$TMP/ab/0001.vcf.gz" && -s "$TMP/ba/0001.vcf.gz" ]] \
+    || die "no discriminating sites after filtering; check --filter and strain VCFs"
+  "$BCF" merge -0 -m none -Oz -o "$PREFIX.vcf.gz" "$TMP/ab/0001.vcf.gz" "$TMP/ba/0001.vcf.gz"
+  "$BCF" index -t "$PREFIX.vcf.gz"
+  "$BCF" query -f "%CHROM\t%POS\t%REF\t%ALT\t$A\n" "$TMP/ab/0001.vcf.gz" > "$TMP/origin_a.tsv"
+  "$BCF" query -f "%CHROM\t%POS\t%REF\t%ALT\t$B\n" "$TMP/ba/0001.vcf.gz" > "$TMP/origin_b.tsv"
+  sort -k1,1 -k2,2n -S 4G "$TMP/origin_a.tsv" "$TMP/origin_b.tsv" > "$TMP/origin.tsv"
+  MODE="dual_strain"
+fi
+
+gzip -c "$TMP/origin.tsv" > "$PREFIX.origin.tsv.gz"
+awk 'BEGIN{OFS="\t"}{print $1, $2-1, $2, $3, $4, $5}' "$TMP/origin.tsv" \
+  | gzip -c > "$PREFIX.dsnp.bed.gz"
+
+cat > "$PREFIX.meta.txt" <<EOF
+strains: $A x $B
+mode: $MODE
+filter: $FILTER
+mgp_version: v5
+date: $(date -Iseconds)
+vcf_samples: $("$BCF" query -l "$PREFIX.vcf.gz" | tr '\n' ' ')
+note: genome1 = first VCF sample column (SNPsplit convention); map per-sample in samples.tsv
+EOF
+
+log "done:"
+log "  vcf:     $PREFIX.vcf.gz ($("$BCF" query -l "$PREFIX.vcf.gz" | wc -l) sample(s))"
+log "  origin:  $PREFIX.origin.tsv.gz"
+log "  bed:     $PREFIX.dsnp.bed.gz"
+log "next: pot-build-masked (SNPsplit_genome_preparation), then update config.yaml dsnp.*"

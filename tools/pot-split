@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# pot-split — assign reads to parental genomes with SNPsplit.
+#
+# Usage: pot-split -b IN.bam -s SAMPLE_ID [OPTIONS]
+#   --snp-file FILE    (default: config dsnp.snp_file, from pot-build-masked)
+#   --single           single-end data (default: paired)
+#   --conflicting      keep conflicting reads separate (default: on)
+#   --no-conflicting   discard conflicting reads
+#   --sort             let SNPsplit sort outputs (default: --no_sort, input pre-sorted)
+#   -o DIR             output dir (default: config defaults.split_dir/<SAMPLE_ID>)
+#   -c, --config FILE
+#
+# Reads the sample row from samples.tsv to label genome1/genome2 as
+# maternal/paternal (genome1/2 follow the dSNP VCF sample order, NOT biology;
+# reciprocal crosses flip direction per sample — see docs/design.md).
+#
+# Outputs: *.genome1.bam, *.genome2.bam, [*.conflicting.bam], [*.unassigned.bam],
+#          split_stats.tsv, snpsplit.log, <SAMPLE>.maternal.bam / paternal.bam symlinks
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+IN=""; SID=""; SNPFILE=""; OUT=""; SINGLE=0; CONFLICTING=1; SORTFLAG="--no_sort"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b) IN="$2"; shift 2 ;;
+    -s) SID="$2"; shift 2 ;;
+    --snp-file) SNPFILE="$2"; shift 2 ;;
+    --single) SINGLE=1; shift ;;
+    --conflicting) CONFLICTING=1; shift ;;
+    --no-conflicting) CONFLICTING=0; shift ;;
+    --sort) SORTFLAG="--sort"; shift ;;
+    -o) OUT="$2"; shift 2 ;;
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$IN" && -s "$IN" ]] || die "-b IN.bam required"
+[[ -n "$SID" ]] || die "-s SAMPLE_ID required"
+[[ -n "$SNPFILE" ]] || SNPFILE="$(potcfg dsnp.snp_file)"
+[[ -n "$SNPFILE" && -s "$SNPFILE" ]] || die "snp_file not found (pot-build-masked output; set dsnp.snp_file)"
+[[ -n "$OUT" ]] || OUT="$(potcfg defaults.split_dir)/$SID"
+[[ -n "$OUT" ]] || OUT="split/$SID"
+mkdir -p "$OUT"
+
+SPLIT="$(pot_resolve tools.snpsplit SNPsplit)"
+ST="$(pot_resolve tools.samtools samtools)"
+
+ARGS=(--snp_file "$SNPFILE")
+[[ $SINGLE -eq 0 ]] && ARGS+=(--paired)
+[[ $CONFLICTING -eq 1 ]] && ARGS+=(--conflicting)
+ARGS+=("$SORTFLAG" -o "$OUT" "$IN")
+
+log "running SNPsplit (log: $OUT/snpsplit.log)"
+"$SPLIT" "${ARGS[@]}" > "$OUT/snpsplit.log" 2>&1 \
+  || { tail -20 "$OUT/snpsplit.log" >&2; die "SNPsplit failed"; }
+
+G1="$(ls "$OUT"/*.genome1.bam 2>/dev/null | head -1 || true)"
+G2="$(ls "$OUT"/*.genome2.bam 2>/dev/null | head -1 || true)"
+[[ -n "$G1" && -n "$G2" ]] || die "SNPsplit outputs not found in $OUT"
+"$ST" index "$G1"
+"$ST" index "$G2"
+
+# Assignment stats -> split_stats.tsv
+stat_of() { sed -nE "s/.*$1: ([0-9]+).*/\1/p" "$OUT/snpsplit.log" | head -1; }
+TOTAL=$(stat_of "Total number of read")
+G1N=$(stat_of "Genome 1 specific")
+G2N=$(stat_of "Genome 2 specific")
+CONF=$(stat_of "Conflicting")
+UNAS=$(stat_of "could not be assigned")
+printf 'sample_id\tgenome1\tgenome2\tconflicting\tunassigned\ttotal\n' > "$OUT/split_stats.tsv"
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$SID" "${G1N:-NA}" "${G2N:-NA}" "${CONF:-NA}" "${UNAS:-NA}" "${TOTAL:-NA}" \
+  >> "$OUT/split_stats.tsv"
+
+# Per-sample parental direction (from samples.tsv); optional but recommended.
+if pot_sample "$SID" genome1 >/dev/null 2>&1; then
+  G1_STRAIN="$(pot_sample "$SID" genome1)"
+  G2_STRAIN="$(pot_sample "$SID" genome2)"
+  MAT="$(pot_sample "$SID" maternal)"
+  PAT="$(pot_sample "$SID" paternal)"
+  label_link() { # $1=bam $2=role
+    local bam="$1" role="$2"
+    [[ -n "$role" ]] || return 0
+    ln -sf "$(basename "$bam")" "$OUT/$SID.$role.bam"
+  }
+  if [[ "$MAT" == "$G1_STRAIN" ]]; then
+    label_link "$G1" maternal
+    label_link "$G2" paternal
+  elif [[ "$MAT" == "$G2_STRAIN" ]]; then
+    label_link "$G2" maternal
+    label_link "$G1" paternal
+  else
+    log "warning: samples.tsv maternal '$MAT' matches neither genome1 ($G1_STRAIN) nor genome2 ($G2_STRAIN); no labels written"
+  fi
+  log "done: $OUT (genome1=$G1_STRAIN genome2=$G2_STRAIN maternal=$MAT paternal=$PAT)"
+else
+  log "note: '$SID' not in samples.tsv; skipping maternal/paternal labels"
+  log "done: $OUT"
+fi

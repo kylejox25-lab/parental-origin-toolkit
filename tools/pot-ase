@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""pot-ase — gene-level allele-specific expression from SNPsplit-split BAMs.
+
+Usage: pot-ase -s SAMPLE_ID [OPTIONS]
+  --split-dir DIR    (default: config defaults.split_dir/<sample_id>)
+  -1/--bam1 FILE, -2/--bam2 FILE   overrides for the two split BAMs
+  --gtf FILE         (default: config annotations.gtf)
+  --paired           count fragments (featureCounts -p)
+  --stranded N       0|1|2 (default: 0)
+  --feature-type T   (default: exon)
+  --attr-type T      (default: gene_id)
+  -t, --threads N    (default: config defaults.threads)
+  -o FILE            output TSV (default: stdout)
+  -c, --config FILE
+
+Output columns: gene_id length <g1> <g2> total <g1>_ratio p_value q_value
+where <g1>/<g2> are the genome1/genome2 strain names from samples.tsv.
+p_value: two-sided binomial test; q_value: Benjamini-Hochberg FDR.
+"""
+import argparse
+import glob
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+import pot_config as pc
+import pot_stats as ps
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Gene-level allele-specific expression (ASE)")
+    ap.add_argument("-s", "--sample", required=True)
+    ap.add_argument("--split-dir")
+    ap.add_argument("-1", "--bam1")
+    ap.add_argument("-2", "--bam2")
+    ap.add_argument("--gtf")
+    ap.add_argument("--paired", action="store_true")
+    ap.add_argument("--stranded", default=0, type=int, choices=[0, 1, 2])
+    ap.add_argument("--feature-type", default="exon")
+    ap.add_argument("--attr-type", default="gene_id")
+    ap.add_argument("-t", "--threads")
+    ap.add_argument("-o", "--output")
+    ap.add_argument("-c", "--config")
+    args = ap.parse_args()
+
+    cfg = pc.load_config(args.config)
+    fc = pc.get_cfg(cfg, "tools.featureCounts", default="featureCounts")
+
+    g1, g2 = args.bam1, args.bam2
+    if not (g1 and g2):
+        split_dir = args.split_dir or os.path.join(
+            pc.get_cfg(cfg, "defaults.split_dir", default="split"), args.sample)
+        found1 = glob.glob(os.path.join(split_dir, "*.genome1.bam"))
+        found2 = glob.glob(os.path.join(split_dir, "*.genome2.bam"))
+        if not (found1 and found2):
+            sys.exit(f"ERROR: split BAMs not found in {split_dir} (run pot-split first)")
+        g1, g2 = found1[0], found2[0]
+
+    gtf = args.gtf or pc.get_cfg(cfg, "annotations.gtf", required=True)
+    threads = args.threads or pc.get_cfg(cfg, "defaults.threads", default="1")
+
+    # strain labels for the count columns
+    rows = pc.load_samples(cfg)
+    if args.sample not in rows:
+        sys.exit(f"ERROR: sample '{args.sample}' not in samples.tsv")
+    row = rows[args.sample]
+    lab1 = row.get("genome1") or "genome1"
+    lab2 = row.get("genome2") or "genome2"
+
+    with tempfile.TemporaryDirectory(prefix="pot_ase_") as tmp:
+        counts = os.path.join(tmp, "counts.txt")
+        cmd = [fc, "-a", gtf, "-o", counts, "-s", str(args.stranded),
+               "-t", args.feature_type, "-g", args.attr_type, "-T", str(threads)]
+        if args.paired:
+            cmd.append("-p")
+        cmd += [g1, g2]
+        subprocess.run(cmd, check=True)
+
+        genes = []
+        with open(counts) as fh:
+            for line in fh:
+                if line.startswith("#") or line.startswith("Geneid"):
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 7:  # Geneid Chr Start End Strand Length c1 c2
+                    continue
+                genes.append({"gene": f[0], "length": f[5],
+                              "c1": int(f[6]), "c2": int(f[7])})
+
+    tested = []
+    for g in genes:
+        total = g["c1"] + g["c2"]
+        g["total"] = total
+        if total == 0:
+            g["ratio"] = 0.5
+            g["p"] = 1.0
+            continue
+        g["ratio"] = g["c1"] / total
+        g["p"] = ps.binomial_pval(g["c1"], total)
+        tested.append((g["gene"], g["p"]))
+    qs = ps.bh_fdr(tested)
+
+    out = open(args.output, "w") if args.output else sys.stdout
+    try:
+        out.write(f"gene_id\tlength\t{lab1}\t{lab2}\ttotal\t{lab1}_ratio\tp_value\tq_value\n")
+        for g in genes:
+            out.write(f"{g['gene']}\t{g['length']}\t{g['c1']}\t{g['c2']}\t"
+                      f"{g['total']}\t{g['ratio']:.4f}\t{g['p']:.4g}\t"
+                      f"{qs.get(g['gene'], 1.0):.4g}\n")
+    finally:
+        if args.output:
+            out.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# pot-get-strain — download Mouse Genomes Project (v5) strain-specific VCFs.
+#
+# Usage: pot-get-strain [OPTIONS] STRAIN [STRAIN ...]
+#   -o, --outdir DIR   download dir (default: config mgp.cache_dir)
+#   --indels           also download the indel VCF for each strain
+#   --list             list the 36 MGP v5 strains with per-strain VCFs
+#   -c, --config FILE  config file (default: config.yaml)
+#
+# Files: <STRAIN>.mgp.v5.snps.dbSNP142.vcf.gz (+ .tbi)
+# Source: config mgp.base_url (Sanger FTP by default; JAX mirror available).
+# Downloads resume on re-run (wget -c) and are gzip-verified.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+# The 36 MGP v5 strains with per-strain VCFs under current_snps/strain_specific_vcfs.
+STRAINS="129P2_OlaHsd 129S1_SvImJ 129S5SvEvBrd A_J AKR_J BALB_cJ BTBR_Ttf_Itpr3tf_J \
+BUB_BnJ C3H_HeH C3H_HeJ C57BL_10J C57BL_6NJ C57BR_cdJ C57L_J C58_J CAST_EiJ CBA_J \
+DBA_1J DBA_2J FVB_NJ I_LnJ KK_HiJ LEWES_EiJ LP_J MOLF_EiJ NOD_ShiLtJ NZB_B1NJ \
+NZO_HlLtJ NZW_LacJ PWK_PhJ RF_J SEA_GnJ SPRET_EiJ ST_bJ WSB_EiJ ZALENDE_EiJ"
+
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+[[ $# -gt 0 ]] || { usage; exit 1; }
+
+OUTDIR=""; INDELS=0; LIST=0
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -o|--outdir) OUTDIR="$2"; shift 2 ;;
+    --indels) INDELS=1; shift ;;
+    --list) LIST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+if [[ $LIST -eq 1 ]]; then
+  for s in $STRAINS; do echo "$s"; done
+  echo "reference aliases: ${REF_ALIASES[*]}" >&2
+  exit 0
+fi
+
+[[ ${#args[@]} -gt 0 ]] || { usage; exit 1; }
+[[ -n "$OUTDIR" ]] || OUTDIR="$(potcfg mgp.cache_dir)"
+[[ -n "$OUTDIR" ]] || die "no output dir: pass -o or set mgp.cache_dir in config.yaml"
+BASE_URL="$(potcfg mgp.base_url)"
+[[ -n "$BASE_URL" ]] || BASE_URL="ftp://ftp-mouse.sanger.ac.uk/current_snps/strain_specific_vcfs"
+WGET="$(pot_resolve tools.wget wget)"
+
+mkdir -p "$OUTDIR"
+
+for s in "${args[@]}"; do
+  if is_ref_strain "$s"; then
+    log "skipping '$s': reference-genome alias, no VCF to download"
+    continue
+  fi
+  case " $STRAINS " in
+    *" $s "*) ;;
+    *) die "unknown strain '$s' (run pot-get-strain --list)" ;;
+  esac
+  for ft in "snps.dbSNP142" "indels.dbSNP142.normed"; do
+    [[ "$ft" == snps* || $INDELS -eq 1 ]] || continue
+    f="${s}.mgp.v5.${ft}.vcf.gz"
+    out="$OUTDIR/$f"
+    if [[ -s "$out" ]]; then
+      log "already present, skipping: $out"
+    else
+      log "downloading $f"
+      "$WGET" -c -t 3 --retry-connrefused --show-progress "$BASE_URL/$f" -O "$out" \
+        || die "download failed: $f"
+    fi
+    if [[ ! -s "$out.tbi" ]]; then
+      "$WGET" -c -t 3 -q "$BASE_URL/$f.tbi" -O "$out.tbi" \
+        || log "warning: no .tbi for $f (index it with tabix if needed)"
+    fi
+    gzip -t "$out" 2>/dev/null || die "corrupt download: $out (delete and re-run)"
+  done
+done
+
+log "done. add entries to config.yaml strains, e.g.:"
+log "  strains:"
+for s in "${args[@]}"; do
+  is_ref_strain "$s" || log "    $s: $OUTDIR/$s.mgp.v5.snps.dbSNP142.vcf.gz"
+done

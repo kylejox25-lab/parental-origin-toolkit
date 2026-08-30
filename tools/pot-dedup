@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# pot-dedup — mark/remove PCR duplicates with picard MarkDuplicates.
+#
+# Usage: pot-dedup -b IN.bam [OPTIONS]
+#   -o OUT.bam      (default: <IN>.dedup.bam)
+#   -m METRICS      (default: <OUT>.metrics.txt)
+#   --keep-dups     keep duplicates (default: remove)
+#   --java-opts S   java options for the picard jar, e.g. "-Xmx8g"
+#   -c, --config FILE
+#
+# Input is expected to be coordinate-sorted (ASSUME_SORTED=true).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+IN=""; OUT=""; METRICS=""; JAVA_OPTS=""; KEEP=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b) IN="$2"; shift 2 ;;
+    -o) OUT="$2"; shift 2 ;;
+    -m) METRICS="$2"; shift 2 ;;
+    --keep-dups) KEEP=1; shift ;;
+    --java-opts) JAVA_OPTS="$2"; shift 2 ;;
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$IN" && -s "$IN" ]] || die "-b IN.bam required"
+[[ -n "$OUT" ]] || OUT="${IN%.bam}.dedup.bam"
+[[ -n "$METRICS" ]] || METRICS="${OUT%.bam}.metrics.txt"
+[[ -n "$JAVA_OPTS" ]] || JAVA_OPTS="-Xmx8g"
+
+PICARD="$(pot_resolve tools.picard picard.jar)"
+REMOVE=true
+[[ $KEEP -eq 1 ]] && REMOVE=false
+
+if [[ "$PICARD" == *.jar ]]; then
+  PICARD_CMD=(java "$JAVA_OPTS" -jar "$PICARD")
+else
+  PICARD_CMD=("$PICARD")
+fi
+
+"${PICARD_CMD[@]}" MarkDuplicates \
+  I="$IN" O="$OUT" M="$METRICS" \
+  REMOVE_DUPLICATES="$REMOVE" CREATE_INDEX=true ASSUME_SORTED=true \
+  VALIDATION_STRINGENCY=LENIENT || die "picard MarkDuplicates failed"
+
+log "done: $OUT (metrics: $METRICS)"

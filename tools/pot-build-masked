@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# pot-build-masked — build the N-masked reference genome with SNPsplit_genome_preparation.
+#
+# Usage: pot-build-masked [OPTIONS]
+#   -v, --vcf FILE       dSNP VCF (default: config dsnp.vcf, pot-build-dsnp output)
+#   --reference-genome D dir with per-chromosome .fa files (default: config genomes.reference_dir)
+#   -o DIR               output dir (default: ./masked_genome)
+#   --no-index           skip the bowtie2 index build
+#   -t, --threads N      bowtie2-build threads (default: config defaults.threads)
+#   -c, --config FILE    config file (default: config.yaml)
+#
+# Mode is detected from the VCF: single sample -> --strain; two samples -> --dual_hybrid.
+# Outputs (paths detected, tolerant to SNPsplit layout variations):
+#   masked.fa           concatenated N-masked genome
+#   masked.fa.fai       samtools index
+#   masked.*.bt2        bowtie2 index (unless --no-index)
+#   all_SNPs_*.txt.gz   snp_file for SNPsplit read assignment (pot-split input)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+VCF=""; REFDIR=""; OUT="masked_genome"; NO_INDEX=0; THREADS=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -v|--vcf) VCF="$2"; shift 2 ;;
+    --reference-genome) REFDIR="$2"; shift 2 ;;
+    -o) OUT="$2"; shift 2 ;;
+    --no-index) NO_INDEX=1; shift ;;
+    -t|--threads) THREADS="$2"; shift 2 ;;
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$VCF" ]] || VCF="$(potcfg dsnp.vcf)"
+[[ -n "$VCF" && -s "$VCF" ]] || die "dSNP VCF not found: run pot-build-dsnp and set dsnp.vcf in config.yaml"
+[[ -n "$REFDIR" ]] || REFDIR="$(potcfg genomes.reference_dir)"
+[[ -n "$REFDIR" && -d "$REFDIR" ]] || die "reference genome dir not found: $REFDIR"
+[[ -n "$THREADS" ]] || THREADS="$(potcfg defaults.threads)"
+[[ -n "$THREADS" ]] || THREADS=1
+
+BCF="$(pot_resolve tools.bcftools bcftools)"
+PREP="$(pot_resolve tools.snpsplit_prep SNPsplit_genome_preparation)"
+B2B="$(pot_resolve tools.bowtie2-build bowtie2-build)"
+ST="$(pot_resolve tools.samtools samtools)"
+
+NSAMP=$("$BCF" query -l "$VCF" | wc -l)
+ARGS=(--vcf_file "$VCF" --reference_genome "$REFDIR")
+if [[ $NSAMP -eq 1 ]]; then
+  ARGS+=(--strain "$("$BCF" query -l "$VCF")")
+  log "mode: single-sample VCF -> --strain"
+elif [[ $NSAMP -eq 2 ]]; then
+  ARGS+=(--dual_hybrid)
+  log "mode: two-sample VCF -> --dual_hybrid"
+else
+  die "unexpected sample count in dSNP VCF: $NSAMP"
+fi
+
+mkdir -p "$OUT"
+log "running SNPsplit_genome_preparation (output in $OUT)"
+(cd "$OUT" && "$PREP" "${ARGS[@]}") || die "SNPsplit_genome_preparation failed"
+
+MASKED_DIR="$(find "$OUT" -maxdepth 2 -type d -name '*N-masked*' | head -1 || true)"
+[[ -n "$MASKED_DIR" ]] || die "could not locate N-masked genome output under $OUT (SNPsplit layout changed? see docs/design.md)"
+FAS="$(find "$MASKED_DIR" -maxdepth 1 \( -name '*.fa' -o -name '*.fasta' \) | sort)"
+[[ -n "$FAS" ]] || die "no fasta files under $MASKED_DIR"
+# shellcheck disable=SC2086
+cat $FAS > "$OUT/masked.fa"
+"$ST" faidx "$OUT/masked.fa"
+
+if [[ $NO_INDEX -eq 0 ]]; then
+  log "building bowtie2 index"
+  "$B2B" --threads "$THREADS" "$OUT/masked.fa" "$OUT/masked" >/dev/null
+fi
+
+SNPFILE="$(find "$OUT" -maxdepth 2 -name 'all_SNPs_*.txt.gz' | head -1 || true)"
+[[ -n "$SNPFILE" ]] || log "warning: snp_file (all_SNPs_*.txt.gz) not found; locate it and set dsnp.snp_file"
+
+cat > "$OUT/meta.txt" <<EOF
+date: $(date -Iseconds)
+vcf: $VCF
+reference_genome_dir: $REFDIR
+mode: $(if [[ $NSAMP -eq 1 ]]; then echo strain; else echo dual_hybrid; fi)
+masked_genome: $OUT/masked.fa
+bowtie2_index: $OUT/masked
+snp_file: ${SNPFILE:-<not found>}
+EOF
+
+log "done. update config.yaml:"
+log "  genomes.masked:         $OUT/masked.fa"
+log "  genomes.bowtie2_index:  $OUT/masked"
+log "  dsnp.snp_file:          ${SNPFILE:-<find all_SNPs_*.txt.gz>}"

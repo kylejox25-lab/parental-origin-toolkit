@@ -1,0 +1,61 @@
+# parental-origin-toolkit configuration.
+# Copy to config.yaml and edit the local paths.
+
+# Sample manifest for batch runs (see samples.example.tsv).
+samples: samples.tsv
+
+# Mouse Genomes Project (v5) data source, used by pot-get-strain.
+mgp:
+  base_url: ftp://ftp-mouse.sanger.ac.uk/current_snps/strain_specific_vcfs
+  # alternative mirror: ftp://ftp.jax.org/SNPtools/variants/
+  cache_dir: reference/mgp_v5
+
+# Strain VCFs (downloaded by pot-get-strain), used by pot-build-dsnp.
+# Strain names = MGP v5 names, e.g. PWK_PhJ, CAST_EiJ, SPRET_EiJ.
+strains:
+  PWK_PhJ: reference/mgp_v5/PWK_PhJ.mgp.v5.snps.dbSNP142.vcf.gz
+  # CAST_EiJ: reference/mgp_v5/CAST_EiJ.mgp.v5.snps.dbSNP142.vcf.gz
+
+genomes:
+  # Directory of per-chromosome .fa files (SNPsplit_genome_preparation input).
+  reference_dir: reference/GRCm38_ref
+  # pot-build-masked outputs:
+  masked: reference/masked_genome/masked.fa
+  bowtie2_index: reference/masked_genome/masked
+  # Optional aligner indexes (pot-align --aligner hisat2|star):
+  hisat2_index: ""
+  star_index: ""
+
+# dSNP set (pot-build-dsnp outputs) and snp_file (pot-build-masked output).
+dsnp:
+  vcf: reference/BL6_PWK.dsnp.vcf.gz
+  bed: reference/BL6_PWK.dsnp.bed.gz
+  snp_file: reference/masked_genome/all_SNPs_PWK_PhJ_GRCm38.txt.gz
+
+# Gene annotation for pot-ase.
+annotations:
+  gtf: reference/gencode.vM25.annotation.gtf
+
+# External tool paths. Names are looked up in PATH when left as plain names;
+# use full paths when they are not on PATH.
+tools:
+  snpsplit: SNPsplit
+  snpsplit_prep: SNPsplit_genome_preparation
+  bcftools: bcftools
+  bowtie2: bowtie2
+  bowtie2-build: bowtie2-build
+  hisat2: hisat2
+  STAR: STAR
+  samtools: samtools
+  picard: picard          # wrapper or path to picard.jar
+  featureCounts: featureCounts
+  bedtools: bedtools
+  bedGraphToBigWig: bedGraphToBigWig
+  wget: wget
+
+defaults:
+  threads: 28
+  aligner: bowtie2        # bowtie2 | hisat2 | star
+  split_dir: split        # pot-split output dir: <split_dir>/<sample_id>
+  bowtie2_params: "-N 1 -L 25"
+  dsnp_filter: 'GT="1/1" && QUAL>=30 && FMT/DP>=10'

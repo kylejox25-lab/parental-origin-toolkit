@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""pot-qc — per-sample QC: SNP-split assignment rates + dSNP site coverage.
+
+Usage: pot-qc -s SAMPLE_ID [OPTIONS]
+  --split-dir DIR   (default: config defaults.split_dir/<sample_id>)
+  --dsnp-bed FILE   (default: config dsnp.bed, from pot-build-dsnp)
+  -o FILE           summary TSV (default: stdout)
+  --per-site FILE   optional per-site coverage TSV
+  -c, --config FILE
+
+Summary columns: sample_id, total_reads, genome1_reads, genome2_reads,
+conflicting_reads, unassigned_reads, dsnp_sites, sites_covered,
+sites_genome1_only, sites_genome2_only, sites_both,
+genome1_site_reads, genome2_site_reads
+"""
+import argparse
+import glob
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+import pot_config as pc
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Per-sample split/coverage QC")
+    ap.add_argument("-s", "--sample", required=True)
+    ap.add_argument("--split-dir")
+    ap.add_argument("--dsnp-bed")
+    ap.add_argument("-o", "--output")
+    ap.add_argument("--per-site")
+    ap.add_argument("-c", "--config")
+    args = ap.parse_args()
+
+    cfg = pc.load_config(args.config)
+    split_dir = args.split_dir or os.path.join(
+        pc.get_cfg(cfg, "defaults.split_dir", default="split"), args.sample)
+
+    # 1) assignment stats from pot-split output
+    stats_path = os.path.join(split_dir, "split_stats.tsv")
+    assignment = {}
+    if os.path.exists(stats_path):
+        with open(stats_path) as fh:
+            header = fh.readline().rstrip("\n").split("\t")
+            vals = fh.readline().rstrip("\n").split("\t")
+        assignment = dict(zip(header, vals))
+
+    # 2) dSNP site coverage via bedtools multicov on the split BAMs
+    g1 = glob.glob(os.path.join(split_dir, "*.genome1.bam"))
+    g2 = glob.glob(os.path.join(split_dir, "*.genome2.bam"))
+    if not (g1 and g2):
+        sys.exit(f"ERROR: split BAMs not found in {split_dir} (run pot-split first)")
+    g1, g2 = g1[0], g2[0]
+
+    dsnp_bed = args.dsnp_bed or pc.get_cfg(cfg, "dsnp.bed", required=True)
+    bt = pc.get_cfg(cfg, "tools.bedtools", default="bedtools")
+
+    proc = subprocess.run([bt, "multicov", "-bams", g1, g2, "-bed", dsnp_bed],
+                          capture_output=True, text=True, check=True)
+    sites = []
+    for line in proc.stdout.splitlines():
+        f = line.split("\t")
+        if len(f) < 8:
+            continue
+        c1, c2 = int(f[6]), int(f[7])
+        sites.append((c1, c2))
+
+    n_sites = len(sites)
+    covered = sum(1 for c1, c2 in sites if c1 + c2 > 0)
+    g1_only = sum(1 for c1, c2 in sites if c1 > 0 and c2 == 0)
+    g2_only = sum(1 for c1, c2 in sites if c2 > 0 and c1 == 0)
+    both = sum(1 for c1, c2 in sites if c1 > 0 and c2 > 0)
+    g1_reads = sum(c1 for c1, _ in sites)
+    g2_reads = sum(c2 for _, c2 in sites)
+
+    cols = ["sample_id", "total_reads", "genome1_reads", "genome2_reads",
+            "conflicting_reads", "unassigned_reads", "dsnp_sites", "sites_covered",
+            "sites_genome1_only", "sites_genome2_only", "sites_both",
+            "genome1_site_reads", "genome2_site_reads"]
+    vals = [args.sample,
+            assignment.get("total", "NA"),
+            assignment.get("genome1", "NA"),
+            assignment.get("genome2", "NA"),
+            assignment.get("conflicting", "NA"),
+            assignment.get("unassigned", "NA"),
+            n_sites, covered, g1_only, g2_only, both, g1_reads, g2_reads]
+
+    out = open(args.output, "w") if args.output else sys.stdout
+    try:
+        out.write("\t".join(cols) + "\n")
+        out.write("\t".join(str(v) for v in vals) + "\n")
+    finally:
+        if args.output:
+            out.close()
+
+    if args.per_site:
+        with open(args.per_site, "w") as fh:
+            fh.write("genome1_reads\tgenome2_reads\n")
+            for c1, c2 in sites:
+                fh.write(f"{c1}\t{c2}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# pot-count — per-region/window counts of genome1/2 reads (bedtools multicov).
+#
+# Usage: pot-count [OPTIONS]
+#   -s SAMPLE_ID [--split-dir DIR]   use SNPsplit outputs for a sample
+#   -1 G1.bam -2 G2.bam              ...or give the two BAMs directly
+#   --regions BED | -w SIZE          regions (>=4 cols, last col = name), or
+#                                    fixed windows over the genome
+#   --labels A B                     count column names (default: genome1 genome2)
+#   -o FILE                          output TSV (default: stdout)
+#   -c, --config FILE
+#
+# Pipe straight into pot-test for imbalance statistics:
+#   pot-count -s S1 --regions regions.bed | pot-test
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+SID=""; SPLIT_DIR=""; B1=""; B2=""; REGIONS=""; WIN=""; L1="genome1"; L2="genome2"; OUT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s) SID="$2"; shift 2 ;;
+    --split-dir) SPLIT_DIR="$2"; shift 2 ;;
+    -1) B1="$2"; shift 2 ;;
+    -2) B2="$2"; shift 2 ;;
+    --regions) REGIONS="$2"; shift 2 ;;
+    -w) WIN="$2"; shift 2 ;;
+    --labels) L1="$2"; L2="$3"; shift 3 ;;
+    -o) OUT="$2"; shift 2 ;;
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+if [[ -z "$B1" || -z "$B2" ]]; then
+  [[ -n "$SID" ]] || die "provide -1/-2 BAMs or -s SAMPLE_ID"
+  [[ -n "$SPLIT_DIR" ]] || SPLIT_DIR="$(potcfg defaults.split_dir)/$SID"
+  [[ -n "$SPLIT_DIR" ]] || SPLIT_DIR="split/$SID"
+  find_split_bams "$SPLIT_DIR"
+  B1="$G1_BAM"; B2="$G2_BAM"
+fi
+
+BT="$(pot_resolve tools.bedtools bedtools)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+if [[ -n "$WIN" ]]; then
+  [[ -n "$REGIONS" ]] && die "use either --regions or -w, not both"
+  sizes_from_bam "$B1" > "$TMP/sizes.txt"
+  "$BT" makewindows -g "$TMP/sizes.txt" -w "$WIN" \
+    | awk 'BEGIN{OFS="\t"}{print $1, $2, $3, $1":"$2"-"$3}' > "$TMP/regions.bed"
+  REGIONS="$TMP/regions.bed"
+else
+  [[ -n "$REGIONS" && -s "$REGIONS" ]] || die "--regions BED required (>=4 columns: chr start end name)"
+fi
+
+"$BT" multicov -bams "$B1" "$B2" -bed "$REGIONS" \
+  | awk -v l1="$L1" -v l2="$L2" \
+    'BEGIN{OFS="\t"; print "chr", "start", "end", "name", l1, l2, "total"}
+     {print $1, $2, $3, $4, $5, $6, $5 + $6}' \
+  > "${OUT:-/dev/stdout}"
+
+if [[ -n "$OUT" ]]; then
+  log "done: $OUT ($(wc -l < "$OUT") lines)"
+else
+  log "done"
+fi

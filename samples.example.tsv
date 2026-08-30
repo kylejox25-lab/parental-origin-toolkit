@@ -1,0 +1,3 @@
+sample_id	bam	genome1	genome2	maternal	paternal
+# F1i_rep1	/data/bam/F1i_rep1.sorted.dedup.bam	PWK_PhJ	BL6	PWK_PhJ	BL6
+# F1r_rep1	/data/bam/F1r_rep1.sorted.dedup.bam	PWK_PhJ	BL6	BL6	PWK_PhJ

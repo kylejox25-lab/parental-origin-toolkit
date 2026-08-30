@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# pot-align — align trimmed FASTQs to the masked reference genome.
+#
+# Usage: pot-align -1 R1.fq.gz -2 R2.fq.gz -s SAMPLE [OPTIONS]
+#        pot-align -U READS.fq.gz -s SAMPLE [OPTIONS]      (single-end)
+#   --aligner NAME   bowtie2 (default) | hisat2 | star
+#   --index PATH     aligner index (default: per-aligner config key)
+#   --params "..."   extra aligner arguments (appended)
+#   -t, --threads N  (default: config defaults.threads)
+#   -o DIR           output dir (default: ./aligned)
+#   -c, --config FILE
+#
+# bowtie2 defaults to config defaults.bowtie2_params ("-N 1 -L 25").
+# Use hisat2/star for spliced RNA-seq alignment.
+# Output: <DIR>/<SAMPLE>.sorted.bam (+ .bai)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/pot-common.sh"
+
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+R1=""; R2=""; SE=""; SID=""; ALIGNER=""; INDEX=""; PARAMS=""; THREADS=""; OUT="aligned"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -1) R1="$2"; shift 2 ;;
+    -2) R2="$2"; shift 2 ;;
+    -U) SE="$2"; shift 2 ;;
+    -s) SID="$2"; shift 2 ;;
+    --aligner) ALIGNER="$2"; shift 2 ;;
+    --index) INDEX="$2"; shift 2 ;;
+    --params) PARAMS="$2"; shift 2 ;;
+    -t|--threads) THREADS="$2"; shift 2 ;;
+    -o) OUT="$2"; shift 2 ;;
+    -c|--config) POT_CONFIG_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$SID" ]] || die "-s SAMPLE is required"
+{ [[ -n "$R1" && -n "$R2" ]] || [[ -n "$SE" ]]; } || die "provide -1/-2 (paired) or -U (single-end)"
+[[ -n "$ALIGNER" ]] || ALIGNER="$(potcfg defaults.aligner)"
+[[ -n "$ALIGNER" ]] || ALIGNER=bowtie2
+[[ -n "$THREADS" ]] || THREADS="$(potcfg defaults.threads)"
+[[ -n "$THREADS" ]] || THREADS=1
+mkdir -p "$OUT"
+OUT_BAM="$OUT/$SID.sorted.bam"
+
+ST="$(pot_resolve tools.samtools samtools)"
+
+case "$ALIGNER" in
+  bowtie2)
+    [[ -n "$INDEX" ]] || INDEX="$(potcfg genomes.bowtie2_index)"
+    [[ -n "$INDEX" ]] || die "bowtie2 index not set (--index or genomes.bowtie2_index)"
+    B2="$(pot_resolve tools.bowtie2 bowtie2)"
+    [[ -n "$PARAMS" ]] || PARAMS="$(potcfg defaults.bowtie2_params)"
+    # shellcheck disable=SC2086  # PARAMS is intentionally word-split
+    if [[ -n "$SE" ]]; then
+      "$B2" -x "$INDEX" -U "$SE" -p "$THREADS" $PARAMS \
+        | "$ST" sort -@ "$THREADS" -O BAM -o "$OUT_BAM" -
+    else
+      "$B2" -x "$INDEX" -1 "$R1" -2 "$R2" -p "$THREADS" $PARAMS \
+        | "$ST" sort -@ "$THREADS" -O BAM -o "$OUT_BAM" -
+    fi
+    ;;
+  hisat2)
+    [[ -n "$INDEX" ]] || INDEX="$(potcfg genomes.hisat2_index)"
+    [[ -n "$INDEX" ]] || die "hisat2 index not set (--index or genomes.hisat2_index)"
+    H2="$(pot_resolve tools.hisat2 hisat2)"
+    # shellcheck disable=SC2086
+    if [[ -n "$SE" ]]; then
+      "$H2" -x "$INDEX" -U "$SE" -p "$THREADS" --no-unal $PARAMS \
+        | "$ST" sort -@ "$THREADS" -O BAM -o "$OUT_BAM" -
+    else
+      "$H2" -x "$INDEX" -1 "$R1" -2 "$R2" -p "$THREADS" --no-unal $PARAMS \
+        | "$ST" sort -@ "$THREADS" -O BAM -o "$OUT_BAM" -
+    fi
+    ;;
+  star)
+    [[ -n "$INDEX" ]] || INDEX="$(potcfg genomes.star_index)"
+    [[ -n "$INDEX" ]] || die "STAR index not set (--index or genomes.star_index)"
+    STAR="$(pot_resolve tools.STAR STAR)"
+    INPUTS=()
+    [[ -n "$R1" ]] && INPUTS+=("$R1")
+    [[ -n "$R2" ]] && INPUTS+=("$R2")
+    [[ -n "$SE" ]] && INPUTS+=("$SE")
+    READCMD=()
+    case "${INPUTS[0]}" in
+      *.gz) READCMD=(--readFilesCommand zcat) ;;
+    esac
+    # shellcheck disable=SC2086
+    "$STAR" --genomeDir "$INDEX" --readFilesIn "${INPUTS[@]}" "${READCMD[@]}" \
+      --runThreadN "$THREADS" --outSAMtype BAM SortedByCoordinate \
+      --outFileNamePrefix "$OUT/${SID}_" $PARAMS
+    mv "$OUT/${SID}_Aligned.sortedByCoord.out.bam" "$OUT_BAM"
+    ;;
+  *)
+    die "unknown aligner: $ALIGNER (bowtie2 | hisat2 | star)"
+    ;;
+esac
+
+"$ST" index "$OUT_BAM"
+log "done: $OUT_BAM"
